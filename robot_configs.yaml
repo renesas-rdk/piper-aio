@@ -1,0 +1,53 @@
+# Robot layouts shared by collection, replay, inference, and LeRobot conversion.
+# Select one with `--robot <name>`.
+#
+# arms: order defines the layout of state/action vectors (7 values per arm: 6 joints + gripper).
+#   name:                used for task config keys (`<name>0`, `<name>_gripper`)
+#   leader_topic:        leader joint states (mode 0) / joint commands to the follower (mode 1)
+#   follower_topic:      follower joint states
+#   follower_pose_topic: follower end-effector pose (piper_msgs/PosCmd)
+#   pos_cmd_topic:       end-effector pose commands to the follower (mode 1)
+# cameras: order defines the camera order in datasets and policy inputs.
+#   name:        dataset key (`/observations/images/<name>`, `observation.images.<name>`)
+#   color_topic: sensor_msgs/Image topic
+#   depth_topic: optional depth topic (RealSense only), used with --use_depth_image
+
+dual:
+  arms:
+    - name: left
+      leader_topic: /leader/joint_left
+      follower_topic: /follower/joint_left
+      follower_pose_topic: /follower/end_pose_euler_left
+      pos_cmd_topic: /follower/pos_cmd_left
+    - name: right
+      leader_topic: /leader/joint_right
+      follower_topic: /follower/joint_right
+      follower_pose_topic: /follower/end_pose_euler_right
+      pos_cmd_topic: /follower/pos_cmd_right
+  cameras:
+    - name: cam_high
+      color_topic: /camera_f/color/image_raw
+      depth_topic: /camera_f/depth/image_rect_raw
+    - name: cam_left_wrist
+      color_topic: /camera_l/color/image_raw
+      depth_topic: /camera_l/depth/image_rect_raw
+    - name: cam_right_wrist
+      color_topic: /camera_r/color/image_raw
+      depth_topic: /camera_r/depth/image_rect_raw
+
+single:
+  arms:
+    - name: arm
+      leader_topic: /leader/joint
+      follower_topic: /follower/joint
+      follower_pose_topic: /follower/end_pose_euler
+      pos_cmd_topic: /follower/pos_cmd
+  cameras:
+    # Both cameras can be RealSense or USB cameras; see piper_ws/src/piper/config/cameras_single.yaml.
+    # USB cameras have no depth stream.
+    - name: cam_side
+      color_topic: /camera_side/color/image_raw
+      depth_topic: /camera_side/depth/image_rect_raw
+    - name: cam_wrist
+      color_topic: /camera_wrist/color/image_raw
+      depth_topic: /camera_wrist/depth/image_rect_raw

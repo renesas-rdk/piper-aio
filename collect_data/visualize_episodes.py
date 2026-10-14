@@ -59,10 +59,8 @@ def save_video(image_dict, action, dt, video_path):
         print(
             "frame:",
             frame_idx,
-            "left_action:",
-            np.round(action[frame_idx][:7], 3),
-            "right_action:",
-            np.round(action[frame_idx][7:], 3),
+            "action:",
+            np.round(action[frame_idx], 3),
         )
 
     writer.release()
@@ -90,8 +88,18 @@ def _plot_series(series_list, labels, names, plot_path, title_prefix, colors):
     print(f"Saved plot to: {plot_path}")
 
 
+def _arm_suffixes(num_dim):
+    """Label suffixes per arm: none for a single arm, left/right for two arms."""
+    num_arms = num_dim // len(ARM_STATE_NAMES)
+    if num_arms == 1:
+        return [""]
+    if num_arms == 2:
+        return ["_left", "_right"]
+    return [f"_{i}" for i in range(num_arms)]
+
+
 def visualize_joints(qpos, action, plot_path):
-    joint_names = [name + "_left" for name in ARM_STATE_NAMES] + [name + "_right" for name in ARM_STATE_NAMES]
+    joint_names = [name + suffix for suffix in _arm_suffixes(qpos.shape[1]) for name in ARM_STATE_NAMES]
     _plot_series(
         [qpos, action],
         ["qpos", "action"],
@@ -103,7 +111,7 @@ def visualize_joints(qpos, action, plot_path):
 
 
 def visualize_eef(eef_pose, plot_path):
-    eef_names = [name + "_left" for name in EEF_STATE_NAMES] + [name + "_right" for name in EEF_STATE_NAMES]
+    eef_names = [name + suffix for suffix in _arm_suffixes(eef_pose.shape[1]) for name in EEF_STATE_NAMES]
     _plot_series([eef_pose], ["eef_pose"], eef_names, plot_path, "EEF", ["royalblue"])
 
 

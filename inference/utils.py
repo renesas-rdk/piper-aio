@@ -8,9 +8,13 @@ import time
 import cv2
 import dm_env
 import numpy as np
-import rospy
 import yaml
 
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.append(PROJECT_ROOT)
+
+from robot_config import ARM_DIM, get_robot_config
 
 TASK_CONFIG_PATH = Path(__file__).with_name("task_configs.yaml")
 
@@ -31,21 +35,34 @@ def get_config(args):
     if task_config is None:
         raise ValueError(f"Invalid task name: {args.task}")
 
-    language_instruction = task_config.get("language_instruction")
-    left0 = task_config.get("left0")
-    right0 = task_config.get("right0")
-    if language_instruction is None or left0 is None or right0 is None:
-        raise ValueError(f"Task config for {args.task} is missing required fields")
+    robot = get_robot_config(args.robot)
+    task_robot = task_config.get("robot")
+    if task_robot is not None and task_robot != robot.name:
+        raise ValueError(f"Task {args.task} is configured for robot '{task_robot}', but --robot is '{robot.name}'")
 
-    state_dim = 14
+    language_instruction = task_config.get("language_instruction")
+    if language_instruction is None:
+        raise ValueError(f"Task config for {args.task} is missing required field: language_instruction")
+
+    # One initial joint position per arm, e.g. left0/right0 for the dual robot or arm0 for the single robot
+    init_qpos = []
+    for arm_name in robot.arm_names:
+        key = f"{arm_name}0"
+        value = task_config.get(key)
+        if value is None:
+            raise ValueError(f"Task config for {args.task} is missing required field: {key}")
+        if len(value) != ARM_DIM:
+            raise ValueError(f"{args.task}.{key} must have {ARM_DIM} values, got {len(value)}")
+        init_qpos.append(value)
 
     config = {
         "episode_len": args.max_publish_step,
-        "state_dim": state_dim,
-        "left0": left0,
-        "right0": right0,
+        "robot": robot.name,
+        "arm_names": robot.arm_names,
+        "state_dim": robot.state_dim,
+        "init_qpos": init_qpos,
         "action_postprocess": task_config.get("action_postprocess", {}),
-        "camera_names": ["cam_high", "cam_left_wrist", "cam_right_wrist"],
+        "camera_names": robot.camera_names,
         "task": args.task,
         "language_instruction": language_instruction,
         "ctrl_type": args.ctrl_type,
@@ -74,19 +91,15 @@ def _apply_gripper_rules(gripper_value, rules):
     return max(0, gripper_value)
 
 
-def process_action(task, action):
-    action = action.copy()
-    left_action = action[:7]
-    right_action = action[7:14]
+def process_action(config, action):
+    """Split a model action into one 7-value action per arm and apply the task's gripper rules."""
+    robot = get_robot_config(config["robot"])
+    arm_actions = [arm_action.copy() for arm_action in robot.split_arms(np.asarray(action)[: robot.state_dim])]
 
-    task_config = TASK_CONFIGS.get(task)
-    if task_config is None:
-        raise ValueError(f"Invalid task name: {task}")
-
-    action_postprocess = task_config.get("action_postprocess", {})
-    left_action[6] = _apply_gripper_rules(left_action[6], action_postprocess.get("left_gripper", []))
-    right_action[6] = _apply_gripper_rules(right_action[6], action_postprocess.get("right_gripper", []))
-    return left_action, right_action
+    action_postprocess = config["action_postprocess"]
+    for arm_name, arm_action in zip(robot.arm_names, arm_actions):
+        arm_action[6] = _apply_gripper_rules(arm_action[6], action_postprocess.get(f"{arm_name}_gripper", []))
+    return arm_actions
 
 
 ### Utility Functions
@@ -107,58 +120,41 @@ def handle_interactive_mode(task_time):
     print("\n" + "=" * 50)
     print(f"Task time: {time.time() - task_time:.1f} s")
     print("INTERACTIVE MODE")
-    print("  'c' - Continue running")
-    print("  'r' - Reset to starting point and restart")
-    print("  'q' - Quit/Stop")
+    print("  -> (right arrow) - Continue running")
+    print("  <- (left arrow)  - Reset to starting point and restart")
+    print("  'q'              - Quit/Stop")
     print("=" * 50)
 
     while True:
-        key = sys.stdin.read(1).lower()
-        if key == "c":
-            print("Continuing...")
-            return "continue"
-        elif key == "r":
-            print("Restarting...")
-            return "reset"
-        elif key == "q":
+        key = sys.stdin.read(1)
+        if key == "\x1b":
+            # Arrow keys arrive as a 3-byte escape sequence: ESC [ C (right) / ESC [ D (left).
+            seq = sys.stdin.read(2)
+            if seq == "[C":
+                print("Continuing...")
+                return "continue"
+            elif seq == "[D":
+                print("Restarting...")
+                return "reset"
+        elif key.lower() == "q":
             print("Stopping...")
             return "quit"
 
 
-def build_observation(observation, config, ros_operator):
-    if observation is None:
+def build_observation(frame, config, ros_operator):
+    if frame is None:
         return None
 
-    (
-        img_front,
-        img_left,
-        img_right,
-        follower_arm_left,
-        follower_arm_right,
-        follower_arm_left_pose,
-        follower_arm_right_pose,
-    ) = observation
-
-    qpos = np.concatenate(
-        (np.array(follower_arm_left.position), np.array(follower_arm_right.position)),
-        axis=0,
-    )
-    eef_pose = ros_operator.build_follower_arm_pose(
-        follower_arm_left_pose,
-        follower_arm_right_pose,
-        follower_arm_left,
-        follower_arm_right,
-    )
-
     return {
-        "qpos": qpos,
-        "eef_pose": eef_pose,
-        "images": {
-            config["camera_names"][0]: img_front,
-            config["camera_names"][1]: img_left,
-            config["camera_names"][2]: img_right,
-        },
+        "qpos": ros_operator.build_qpos(frame),
+        "eef_pose": ros_operator.build_follower_arm_pose(frame),
+        "images": {name: frame["images"][name] for name in config["camera_names"]},
     }
+
+
+def get_policy_images(observation, config):
+    """Camera images of an observation, keyed by camera name in robot camera order."""
+    return {name: observation["images"][name] for name in config["camera_names"]}
 
 
 def get_inference_observation(args, config, ros_operator):
@@ -208,16 +204,18 @@ def save_inference_data(args, timesteps, actions, dataset_path):
         obs = root.create_group("observations")
         image = obs.create_group("images")
         for cam_name in args.camera_names:
+            image_shape = first_observation["images"][cam_name].shape
             _ = image.create_dataset(
                 cam_name,
-                (data_size, 480, 640, 3),
+                (data_size, *image_shape),
                 dtype="uint8",
-                chunks=(1, 480, 640, 3),
+                chunks=(1, *image_shape),
             )
 
-        _ = obs.create_dataset("qpos", (data_size, 14))
-        _ = obs.create_dataset("eef_pose", (data_size, 14))
-        _ = root.create_dataset("action", (data_size, 14))
+        state_dim = len(first_observation["qpos"])
+        _ = obs.create_dataset("qpos", (data_size, state_dim), dtype="float32")
+        _ = obs.create_dataset("eef_pose", (data_size, state_dim), dtype="float32")
+        _ = root.create_dataset("action", (data_size, state_dim), dtype="float32")
         _ = root.create_dataset("collect", (data_size,), dtype=h5py.string_dtype(encoding="utf-8"))
 
         for name, array in data_dict.items():
@@ -263,7 +261,9 @@ class InferenceDataRecorder:
             print(f"Recorded inference frames: {len(self.actions)}")
 
     def should_stop_waiting(self):
-        return rospy.is_shutdown() or (self.shutdown_event is not None and self.shutdown_event.is_set())
+        from ros_operator import is_shutdown
+
+        return is_shutdown() or (self.shutdown_event is not None and self.shutdown_event.is_set())
 
     def wait_save_choice(self):
         print(

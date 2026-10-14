@@ -3,69 +3,85 @@
 # mode=0 publishes both leader and follower arm state to ROS.
 # mode=1 controls the follower arm from leader topics.
 import math
+import sys
 import threading
 import time
 
-import rosnode
-import rospy
+import rclpy
 from geometry_msgs.msg import PoseStamped
 from piper_msgs.msg import PiperStatusMsg, PosCmd
-from piper_sdk import *
-from piper_sdk import C_PiperInterface
+from pyAgxArm import ArmModel, AgxArmFactory, PiperFW, create_agx_arm_config
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.exceptions import ROSInterruptException
+from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
+from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool
-from std_srvs.srv import Trigger, TriggerResponse
-from tf.transformations import quaternion_from_euler
+from std_srvs.srv import Trigger
+
+# CAN-command speed rates (0-100%), matching the old piper_sdk ModeCtrl calls.
+LEADER_PUBLISH_SPEED_PCT = 50  # end-effector pose control (pos_callback)
+LEADER_JOINT_SPEED_PCT = 100  # joint control (joint_callback)
+
+_FIRMWARE_VERSIONS = {
+    "default": PiperFW.DEFAULT,
+    "v183": PiperFW.V183,
+    "v188": PiperFW.V188,
+    "v189": PiperFW.V189,
+}
 
 
-def check_roscore():
-    try:
-        rosnode.rosnode_ping("rosout", max_count=1, verbose=False)
-        rospy.loginfo("roscore is running.")
-    except rosnode.ROSNodeIOException:
-        rospy.logerr("roscore is not running.")
-        raise RuntimeError("roscore is not running.")
+def quaternion_from_euler(roll, pitch, yaw):
+    """Return (x, y, z, w) for static-axis roll/pitch/yaw, matching tf.transformations' default 'sxyz'."""
+    cr, sr = math.cos(roll / 2), math.sin(roll / 2)
+    cp, sp = math.cos(pitch / 2), math.sin(pitch / 2)
+    cy, sy = math.cos(yaw / 2), math.sin(yaw / 2)
+    return (
+        sr * cp * cy - cr * sp * sy,
+        cr * sp * cy + sr * cp * sy,
+        cr * cp * sy - sr * sp * cy,
+        cr * cp * cy + sr * sp * sy,
+    )
 
 
-class C_PiperRosNode:
+class C_PiperRosNode(Node):
     """Piper ROS node."""
 
     def __init__(self) -> None:
-        check_roscore()
-        rospy.init_node("piper_start_all_node", anonymous=True)
+        super().__init__("piper_start_all_node")
+        logger = self.get_logger()
 
-        self.can_port = "can0"
-        if rospy.has_param("~can_port"):
-            self.can_port = rospy.get_param("~can_port")
-            rospy.loginfo("%s is %s", rospy.resolve_name("~can_port"), self.can_port)
-        else:
-            rospy.loginfo("can_port parameter not found, please use _can_port:=can0.")
-            exit(0)
-        self.mode = 0
-        if rospy.has_param("~mode"):
-            self.mode = rospy.get_param("~mode")
-            rospy.loginfo("%s is %s", rospy.resolve_name("~mode"), self.mode)
-        else:
-            rospy.loginfo("mode parameter not found, please use _mode:=0.")
-            exit(0)
+        self.can_port = self.declare_parameter("can_port", "").value
+        if not self.can_port:
+            logger.info("can_port parameter not found, please use --ros-args -p can_port:=can0.")
+            sys.exit(0)
+        logger.info(f"can_port is {self.can_port}")
+        self.mode = self.declare_parameter("mode", -1).value
+        if self.mode not in (0, 1):
+            logger.info("mode parameter not found, please use --ros-args -p mode:=0.")
+            sys.exit(0)
+        logger.info(f"mode is {self.mode}")
 
-        self.auto_enable = False
-        if rospy.has_param("~auto_enable"):
-            if rospy.get_param("~auto_enable") and self.mode == 1:
-                self.auto_enable = True
-        rospy.loginfo("%s is %s", rospy.resolve_name("~auto_enable"), self.auto_enable)
+        self.auto_enable = bool(self.declare_parameter("auto_enable", False).value) and self.mode == 1
+        logger.info(f"auto_enable is {self.auto_enable}")
         self.gripper_exist = True
-        # publish
-        self.joint_std_pub_follower = rospy.Publisher(
-            "/follower/joint_states", JointState, queue_size=1, tcp_nodelay=True
-        )
-        if self.mode == 0:
-            self.joint_std_pub_leader = rospy.Publisher(
-                "/leader/joint_states", JointState, queue_size=1, tcp_nodelay=True
+
+        firmware_version = self.declare_parameter("firmware_version", "v189").value
+        if firmware_version not in _FIRMWARE_VERSIONS:
+            logger.info(
+                f"Unknown firmware_version '{firmware_version}', expected one of "
+                f"{list(_FIRMWARE_VERSIONS)}. Falling back to 'v189'."
             )
-        self.arm_status_pub = rospy.Publisher("/follower/arm_status", PiperStatusMsg, queue_size=1, tcp_nodelay=True)
-        self.end_pose_pub = rospy.Publisher("/follower/end_pose", PoseStamped, queue_size=1, tcp_nodelay=True)
-        self.end_pose_euler_pub = rospy.Publisher("/follower/end_pose_euler", PosCmd, queue_size=1, tcp_nodelay=True)
+            firmware_version = "v189"
+        logger.info(f"firmware_version is {firmware_version}")
+
+        # publish
+        self.joint_std_pub_follower = self.create_publisher(JointState, "/follower/joint_states", 1)
+        if self.mode == 0:
+            self.joint_std_pub_leader = self.create_publisher(JointState, "/leader/joint_states", 1)
+        self.arm_status_pub = self.create_publisher(PiperStatusMsg, "/follower/arm_status", 1)
+        self.end_pose_pub = self.create_publisher(PoseStamped, "/follower/end_pose", 1)
+        self.end_pose_euler_pub = self.create_publisher(PosCmd, "/follower/end_pose_euler", 1)
         self.__enable_flag = False
         self.joint_state_follower = JointState()
         self.joint_state_follower.name = [
@@ -94,70 +110,74 @@ class C_PiperRosNode:
         self.joint_state_leader.velocity = [0.0] * 7
         self.joint_state_leader.effort = [0.0] * 7
 
-        self.piper = C_PiperInterface(can_name=self.can_port)
-        self.piper.ConnectPort()
+        cfg = create_agx_arm_config(
+            robot=ArmModel.PIPER,
+            firmeware_version=_FIRMWARE_VERSIONS[firmware_version],
+            interface="socketcan",
+            channel=self.can_port,
+        )
+        self.piper = AgxArmFactory.create_arm(cfg)
+        self.piper.connect()
+        self.gripper = self.piper.init_effector(self.piper.OPTIONS.EFFECTOR.AGX_GRIPPER)
         # service
         str_can_port = str(self.can_port)
         # Leader arm home service.
-        self.leader_go_zero_service = rospy.Service(
-            "/" + str_can_port + "/go_zero_leader",
+        self.leader_go_zero_service = self.create_service(
             Trigger,
+            "/" + str_can_port + "/go_zero_leader",
             self.handle_leader_go_zero_service,
         )
         # Leader and follower arm home service.
-        self.leader_follower_go_zero_service = rospy.Service(
-            "/" + str_can_port + "/go_zero_leader_follower",
+        self.leader_follower_go_zero_service = self.create_service(
             Trigger,
+            "/" + str_can_port + "/go_zero_leader_follower",
             self.handle_leader_follower_go_zero_service,
         )
         # Restore leader-follower mode service.
-        self.restore_leader_follower_mode_service = rospy.Service(
-            "/" + str_can_port + "/restore_leader_follower_mode",
+        self.restore_leader_follower_mode_service = self.create_service(
             Trigger,
+            "/" + str_can_port + "/restore_leader_follower_mode",
             self.handle_restore_leader_follower_mode_service,
         )
         if self.mode == 1:
-            sub_pos_th = threading.Thread(target=self.SubPosThread)
-            sub_joint_th = threading.Thread(target=self.SubJointThread)
-            sub_enable_th = threading.Thread(target=self.SubEnableThread)
-
-            sub_pos_th.daemon = True
-            sub_joint_th.daemon = True
-            sub_enable_th.daemon = True
-
-            sub_pos_th.start()
-            sub_joint_th.start()
-            sub_enable_th.start()
+            # Each subscription gets its own callback group so pose, joint and enable commands
+            # are handled concurrently by the multi-threaded executor (like the ROS 1 threads).
+            self.create_subscription(
+                PosCmd, "/pos_cmd", self.pos_callback, 1, callback_group=MutuallyExclusiveCallbackGroup()
+            )
+            self.create_subscription(
+                JointState,
+                "/leader/joint_states",
+                self.joint_callback,
+                1,
+                callback_group=MutuallyExclusiveCallbackGroup(),
+            )
+            self.create_subscription(
+                Bool, "/enable_flag", self.enable_callback, 1, callback_group=MutuallyExclusiveCallbackGroup()
+            )
 
     def GetEnableFlag(self):
         return self.__enable_flag
 
     def Pubilsh(self):
         """Publish arm messages."""
-        rate = rospy.Rate(200)  # 200 Hz
+        rate = self.create_rate(200)  # 200 Hz
         enable_flag = False
         timeout = 5
         start_time = time.time()
         elapsed_time_flag = False
-        while not rospy.is_shutdown():
+        while rclpy.ok():
             if self.auto_enable and self.mode == 1:
                 while not (enable_flag):
                     elapsed_time = time.time() - start_time
                     print("--------------------")
-                    enable_flag = (
-                        self.piper.GetArmLowSpdInfoMsgs().motor_1.foc_status.driver_enable_status
-                        and self.piper.GetArmLowSpdInfoMsgs().motor_2.foc_status.driver_enable_status
-                        and self.piper.GetArmLowSpdInfoMsgs().motor_3.foc_status.driver_enable_status
-                        and self.piper.GetArmLowSpdInfoMsgs().motor_4.foc_status.driver_enable_status
-                        and self.piper.GetArmLowSpdInfoMsgs().motor_5.foc_status.driver_enable_status
-                        and self.piper.GetArmLowSpdInfoMsgs().motor_6.foc_status.driver_enable_status
-                    )
+                    enable_flag = all(self.piper.get_joints_enable_status_list())
                     print("Enable Status:", enable_flag)
                     if enable_flag:
                         self.__enable_flag = True
-                    self.piper.EnableArm(7)
-                    self.piper.GripperCtrl(0, 1000, 0x02, 0)
-                    self.piper.GripperCtrl(0, 1000, 0x01, 0)
+                    self.piper.enable()
+                    self.gripper.reset_gripper()
+                    self.gripper.move_gripper_m(0.0, force=1.0)
                     print("--------------------")
                     if elapsed_time > timeout:
                         print("timeout....")
@@ -168,7 +188,8 @@ class C_PiperRosNode:
                     pass
             if elapsed_time_flag:
                 print("auto enable timeout, exiting program")
-                exit(0)
+                rclpy.try_shutdown()
+                return
             self.PublishFollowerArmJointAndGripper()
             self.PublishFollowerArmState()
             self.PublishFollowerArmEndPose()
@@ -178,262 +199,188 @@ class C_PiperRosNode:
             rate.sleep()
 
     def PublishFollowerArmState(self):
+        status = self.piper.get_arm_status()
+        if status is None:
+            return
         arm_status = PiperStatusMsg()
-        arm_status.ctrl_mode = self.piper.GetArmStatus().arm_status.ctrl_mode
-        arm_status.arm_status = self.piper.GetArmStatus().arm_status.arm_status
-        arm_status.mode_feedback = self.piper.GetArmStatus().arm_status.mode_feed
-        arm_status.teach_status = self.piper.GetArmStatus().arm_status.teach_status
-        arm_status.motion_status = self.piper.GetArmStatus().arm_status.motion_status
-        arm_status.trajectory_num = self.piper.GetArmStatus().arm_status.trajectory_num
-        arm_status.err_code = self.piper.GetArmStatus().arm_status.err_code
-        arm_status.joint_1_angle_limit = self.piper.GetArmStatus().arm_status.err_status.joint_1_angle_limit
-        arm_status.joint_2_angle_limit = self.piper.GetArmStatus().arm_status.err_status.joint_2_angle_limit
-        arm_status.joint_3_angle_limit = self.piper.GetArmStatus().arm_status.err_status.joint_3_angle_limit
-        arm_status.joint_4_angle_limit = self.piper.GetArmStatus().arm_status.err_status.joint_4_angle_limit
-        arm_status.joint_5_angle_limit = self.piper.GetArmStatus().arm_status.err_status.joint_5_angle_limit
-        arm_status.joint_6_angle_limit = self.piper.GetArmStatus().arm_status.err_status.joint_6_angle_limit
-        arm_status.communication_status_joint_1 = (
-            self.piper.GetArmStatus().arm_status.err_status.communication_status_joint_1
-        )
-        arm_status.communication_status_joint_2 = (
-            self.piper.GetArmStatus().arm_status.err_status.communication_status_joint_2
-        )
-        arm_status.communication_status_joint_3 = (
-            self.piper.GetArmStatus().arm_status.err_status.communication_status_joint_3
-        )
-        arm_status.communication_status_joint_4 = (
-            self.piper.GetArmStatus().arm_status.err_status.communication_status_joint_4
-        )
-        arm_status.communication_status_joint_5 = (
-            self.piper.GetArmStatus().arm_status.err_status.communication_status_joint_5
-        )
-        arm_status.communication_status_joint_6 = (
-            self.piper.GetArmStatus().arm_status.err_status.communication_status_joint_6
-        )
+        arm_status.ctrl_mode = status.msg.ctrl_mode
+        arm_status.arm_status = status.msg.arm_status
+        arm_status.mode_feedback = status.msg.mode_feedback
+        arm_status.teach_status = status.msg.teach_status
+        arm_status.motion_status = status.msg.motion_status
+        arm_status.trajectory_num = status.msg.trajectory_num
+        # pyAgxArm has no single packed err_code; the per-joint flags below
+        # carry the same information, so this field is left at its default.
+        arm_status.joint_1_angle_limit = status.msg.err_status.joint_1_angle_limit
+        arm_status.joint_2_angle_limit = status.msg.err_status.joint_2_angle_limit
+        arm_status.joint_3_angle_limit = status.msg.err_status.joint_3_angle_limit
+        arm_status.joint_4_angle_limit = status.msg.err_status.joint_4_angle_limit
+        arm_status.joint_5_angle_limit = status.msg.err_status.joint_5_angle_limit
+        arm_status.joint_6_angle_limit = status.msg.err_status.joint_6_angle_limit
+        arm_status.communication_status_joint_1 = status.msg.err_status.communication_status_joint_1
+        arm_status.communication_status_joint_2 = status.msg.err_status.communication_status_joint_2
+        arm_status.communication_status_joint_3 = status.msg.err_status.communication_status_joint_3
+        arm_status.communication_status_joint_4 = status.msg.err_status.communication_status_joint_4
+        arm_status.communication_status_joint_5 = status.msg.err_status.communication_status_joint_5
+        arm_status.communication_status_joint_6 = status.msg.err_status.communication_status_joint_6
         self.arm_status_pub.publish(arm_status)
 
     def PublishFollowerArmEndPose(self):
+        flange_pose = self.piper.get_flange_pose()
+        gripper_status = self.gripper.get_gripper_status()
+        if flange_pose is None or gripper_status is None:
+            return
+
+        x, y, z, roll, pitch, yaw = flange_pose.msg
+
         endpos = PoseStamped()
-        endpos.pose.position.x = self.piper.GetArmEndPoseMsgs().end_pose.X_axis / 1000000
-        endpos.pose.position.y = self.piper.GetArmEndPoseMsgs().end_pose.Y_axis / 1000000
-        endpos.pose.position.z = self.piper.GetArmEndPoseMsgs().end_pose.Z_axis / 1000000
-        roll = self.piper.GetArmEndPoseMsgs().end_pose.RX_axis / 1000
-        pitch = self.piper.GetArmEndPoseMsgs().end_pose.RY_axis / 1000
-        yaw = self.piper.GetArmEndPoseMsgs().end_pose.RZ_axis / 1000
-        roll = math.radians(roll)
-        pitch = math.radians(pitch)
-        yaw = math.radians(yaw)
+        endpos.pose.position.x = x
+        endpos.pose.position.y = y
+        endpos.pose.position.z = z
         quaternion = quaternion_from_euler(roll, pitch, yaw)
         endpos.pose.orientation.x = quaternion[0]
         endpos.pose.orientation.y = quaternion[1]
         endpos.pose.orientation.z = quaternion[2]
         endpos.pose.orientation.w = quaternion[3]
-        endpos.header.stamp = rospy.Time.now()
+        endpos.header.stamp = self.get_clock().now().to_msg()
         self.end_pose_pub.publish(endpos)
 
         end_pose_euler = PosCmd()
-        end_pose_euler.x = self.piper.GetArmEndPoseMsgs().end_pose.X_axis / 1000000
-        end_pose_euler.y = self.piper.GetArmEndPoseMsgs().end_pose.Y_axis / 1000000
-        end_pose_euler.z = self.piper.GetArmEndPoseMsgs().end_pose.Z_axis / 1000000
+        end_pose_euler.x = x
+        end_pose_euler.y = y
+        end_pose_euler.z = z
         end_pose_euler.roll = roll
         end_pose_euler.pitch = pitch
         end_pose_euler.yaw = yaw
-        end_pose_euler.gripper = self.piper.GetArmGripperMsgs().gripper_state.grippers_angle / 1000000
+        end_pose_euler.gripper = gripper_status.msg.value
         end_pose_euler.mode1 = 0
         end_pose_euler.mode2 = 0
         self.end_pose_euler_pub.publish(end_pose_euler)
 
     def PublishFollowerArmJointAndGripper(self):
-        self.joint_state_follower.header.stamp = rospy.Time.now()
-        joint_0: float = (self.piper.GetArmJointMsgs().joint_state.joint_1 / 1000) * 0.017444
-        joint_1: float = (self.piper.GetArmJointMsgs().joint_state.joint_2 / 1000) * 0.017444
-        joint_2: float = (self.piper.GetArmJointMsgs().joint_state.joint_3 / 1000) * 0.017444
-        joint_3: float = (self.piper.GetArmJointMsgs().joint_state.joint_4 / 1000) * 0.017444
-        joint_4: float = (self.piper.GetArmJointMsgs().joint_state.joint_5 / 1000) * 0.017444
-        joint_5: float = (self.piper.GetArmJointMsgs().joint_state.joint_6 / 1000) * 0.017444
-        joint_6: float = self.piper.GetArmGripperMsgs().gripper_state.grippers_angle / 1000000
-        vel_0: float = self.piper.GetArmHighSpdInfoMsgs().motor_1.motor_speed / 1000
-        vel_1: float = self.piper.GetArmHighSpdInfoMsgs().motor_2.motor_speed / 1000
-        vel_2: float = self.piper.GetArmHighSpdInfoMsgs().motor_3.motor_speed / 1000
-        vel_3: float = self.piper.GetArmHighSpdInfoMsgs().motor_4.motor_speed / 1000
-        vel_4: float = self.piper.GetArmHighSpdInfoMsgs().motor_5.motor_speed / 1000
-        vel_5: float = self.piper.GetArmHighSpdInfoMsgs().motor_6.motor_speed / 1000
-        effort_6: float = self.piper.GetArmGripperMsgs().gripper_state.grippers_effort / 1000
-        self.joint_state_follower.position = [
-            joint_0,
-            joint_1,
-            joint_2,
-            joint_3,
-            joint_4,
-            joint_5,
-            joint_6,
-        ]  # Example values
-        self.joint_state_follower.velocity = [
-            vel_0,
-            vel_1,
-            vel_2,
-            vel_3,
-            vel_4,
-            vel_5,
-            0.0,
-        ]  # Example values
-        self.joint_state_follower.effort[6] = effort_6
+        joint_angles = self.piper.get_joint_angles()
+        gripper_status = self.gripper.get_gripper_status()
+        if joint_angles is None or gripper_status is None:
+            return
+
+        self.joint_state_follower.header.stamp = self.get_clock().now().to_msg()
+        self.joint_state_follower.position = [*joint_angles.msg, gripper_status.msg.value]
+
+        velocities = []
+        for joint_index in range(1, 7):
+            motor_state = self.piper.get_motor_states(joint_index)
+            velocities.append(motor_state.msg.velocity if motor_state is not None else 0.0)
+        self.joint_state_follower.velocity = [*velocities, 0.0]
+
+        self.joint_state_follower.effort[6] = gripper_status.msg.force
         self.joint_std_pub_follower.publish(self.joint_state_follower)
 
     def PublishLeaderArmJointAndGripper(self):
-        self.joint_state_leader.header.stamp = rospy.Time.now()
-        joint_0: float = (self.piper.GetArmJointCtrl().joint_ctrl.joint_1 / 1000) * 0.017444
-        joint_1: float = (self.piper.GetArmJointCtrl().joint_ctrl.joint_2 / 1000) * 0.017444
-        joint_2: float = (self.piper.GetArmJointCtrl().joint_ctrl.joint_3 / 1000) * 0.017444
-        joint_3: float = (self.piper.GetArmJointCtrl().joint_ctrl.joint_4 / 1000) * 0.017444
-        joint_4: float = (self.piper.GetArmJointCtrl().joint_ctrl.joint_5 / 1000) * 0.017444
-        joint_5: float = (self.piper.GetArmJointCtrl().joint_ctrl.joint_6 / 1000) * 0.017444
-        joint_6: float = self.piper.GetArmGripperCtrl().gripper_ctrl.grippers_angle / 1000000
-        self.joint_state_leader.position = [
-            joint_0,
-            joint_1,
-            joint_2,
-            joint_3,
-            joint_4,
-            joint_5,
-            joint_6,
-        ]  # Example values
+        leader_angles = self.piper.get_leader_joint_angles()
+        gripper_ctrl = self.gripper.get_gripper_ctrl_states()
+        if leader_angles is None or gripper_ctrl is None:
+            return
+
+        self.joint_state_leader.header.stamp = self.get_clock().now().to_msg()
+        self.joint_state_leader.position = [*leader_angles.msg, gripper_ctrl.msg.value]
         self.joint_std_pub_leader.publish(self.joint_state_leader)
-
-    def SubPosThread(self):
-        """Subscribe to end-effector pose commands."""
-        rospy.Subscriber("/pos_cmd", PosCmd, self.pos_callback, queue_size=1, tcp_nodelay=True)
-        rospy.spin()
-
-    def SubJointThread(self):
-        """Subscribe to joint commands."""
-        rospy.Subscriber(
-            "/leader/joint_states",
-            JointState,
-            self.joint_callback,
-            queue_size=1,
-            tcp_nodelay=True,
-        )
-        rospy.spin()
-
-    def SubEnableThread(self):
-        """Subscribe to enable commands."""
-        rospy.Subscriber("/enable_flag", Bool, self.enable_callback, queue_size=1, tcp_nodelay=True)
-        rospy.spin()
 
     def pos_callback(self, pos_data):
         """Handle end-effector pose commands."""
-        factor = 180 / 3.1415926
-        x = round(pos_data.x * 1000) * 1000
-        y = round(pos_data.y * 1000) * 1000
-        z = round(pos_data.z * 1000) * 1000
-        rx = round(pos_data.roll * 1000 * factor)
-        ry = round(pos_data.pitch * 1000 * factor)
-        rz = round(pos_data.yaw * 1000 * factor)
-        rospy.loginfo("Received PosCmd:")
-        rospy.loginfo("x: %f", x)
-        rospy.loginfo("y: %f", y)
-        rospy.loginfo("z: %f", z)
-        rospy.loginfo("roll: %f", rx)
-        rospy.loginfo("pitch: %f", ry)
-        rospy.loginfo("yaw: %f", rz)
-        rospy.loginfo("gripper: %f", pos_data.gripper)
-        rospy.loginfo("mode1: %d", pos_data.mode1)
-        rospy.loginfo("mode2: %d", pos_data.mode2)
+        self.get_logger().info("Received PosCmd:")
+        self.get_logger().info(f"x: {pos_data.x}")
+        self.get_logger().info(f"y: {pos_data.y}")
+        self.get_logger().info(f"z: {pos_data.z}")
+        self.get_logger().info(f"roll: {pos_data.roll}")
+        self.get_logger().info(f"pitch: {pos_data.pitch}")
+        self.get_logger().info(f"yaw: {pos_data.yaw}")
+        self.get_logger().info(f"gripper: {pos_data.gripper}")
+        self.get_logger().info(f"mode1: {pos_data.mode1}")
+        self.get_logger().info(f"mode2: {pos_data.mode2}")
         if self.GetEnableFlag():
-            self.piper.MotionCtrl_1(0x00, 0x00, 0x00)
-            self.piper.MotionCtrl_2(0x01, 0x00, 50)
-            self.piper.EndPoseCtrl(x, y, z, rx, ry, rz)
-            gripper = round(pos_data.gripper * 1000 * 1000)
-            if pos_data.gripper > 80000:
-                gripper = 80000
-            if pos_data.gripper < 0:
-                gripper = 0
+            self.piper.set_speed_percent(LEADER_PUBLISH_SPEED_PCT)
+            self.piper.move_p([pos_data.x, pos_data.y, pos_data.z, pos_data.roll, pos_data.pitch, pos_data.yaw])
             if self.gripper_exist:
-                self.piper.GripperCtrl(abs(gripper), 1000, 0x01, 0)
-            self.piper.MotionCtrl_2(0x01, 0x00, 50)
+                gripper = max(0.0, min(0.08, pos_data.gripper))
+                self.gripper.move_gripper_m(abs(gripper), force=1.0)
 
     def joint_callback(self, joint_data):
         """Handle joint commands."""
-        factor = 57324.840764  # 1000*180/3.14
-        factor1 = 57.32484
-        rospy.loginfo("Received Joint States:")
-        rospy.loginfo("joint_0: %f", joint_data.position[0] * 1)
-        rospy.loginfo("joint_1: %f", joint_data.position[1] * 1)
-        rospy.loginfo("joint_2: %f", joint_data.position[2] * 1)
-        rospy.loginfo("joint_3: %f", joint_data.position[3] * 1)
-        rospy.loginfo("joint_4: %f", joint_data.position[4] * 1)
-        rospy.loginfo("joint_5: %f", joint_data.position[5] * 1)
-        rospy.loginfo("joint_6: %f", joint_data.position[6] * 1)
-        joint_0 = round(joint_data.position[0] * factor)
-        joint_1 = round(joint_data.position[1] * factor)
-        joint_2 = round(joint_data.position[2] * factor)
-        joint_3 = round(joint_data.position[3] * factor)
-        joint_4 = round(joint_data.position[4] * factor)
-        joint_5 = round(joint_data.position[5] * factor)
-        joint_6 = round(joint_data.position[6] * 1000 * 1000)
-        if joint_6 > 80000:
-            joint_6 = 80000
-        if joint_6 < 0:
-            joint_6 = 0
+        self.get_logger().info("Received Joint States:")
+        self.get_logger().info(f"joint_0: {joint_data.position[0]}")
+        self.get_logger().info(f"joint_1: {joint_data.position[1]}")
+        self.get_logger().info(f"joint_2: {joint_data.position[2]}")
+        self.get_logger().info(f"joint_3: {joint_data.position[3]}")
+        self.get_logger().info(f"joint_4: {joint_data.position[4]}")
+        self.get_logger().info(f"joint_5: {joint_data.position[5]}")
+        self.get_logger().info(f"joint_6: {joint_data.position[6]}")
         if self.GetEnableFlag():
-            self.piper.MotionCtrl_2(0x01, 0x01, 100)
-            self.piper.JointCtrl(joint_0, joint_1, joint_2, joint_3, joint_4, joint_5)
-            self.piper.GripperCtrl(abs(joint_6), 1000, 0x01, 0)
-            self.piper.MotionCtrl_2(0x01, 0x01, 100)
-            pass
+            self.piper.set_speed_percent(LEADER_JOINT_SPEED_PCT)
+            self.piper.move_j(list(joint_data.position[:6]))
+            gripper = max(0.0, min(0.08, joint_data.position[6]))
+            self.gripper.move_gripper_m(abs(gripper), force=1.0)
 
     def enable_callback(self, enable_flag: Bool):
         """Handle enable commands."""
-        rospy.loginfo("Received enable flag:")
-        rospy.loginfo("enable_flag: %s", enable_flag.data)
+        self.get_logger().info("Received enable flag:")
+        self.get_logger().info(f"enable_flag: {enable_flag.data}")
         if enable_flag.data:
             self.__enable_flag = True
-            self.piper.EnableArm(7)
-            self.piper.GripperCtrl(0, 1000, 0x02, 0)
-            self.piper.GripperCtrl(0, 1000, 0x01, 0)
+            self.piper.enable()
+            self.gripper.reset_gripper()
+            self.gripper.move_gripper_m(0.0, force=1.0)
         else:
             self.__enable_flag = False
-            self.piper.DisableArm(7)
-            self.piper.GripperCtrl(0, 1000, 0x00, 0)
+            self.piper.disable()
+            self.gripper.disable_gripper()
 
-    def handle_leader_go_zero_service(self, req):
-        response = TriggerResponse()
-        rospy.loginfo(f"-----------------------RESET---------------------------")
-        rospy.loginfo(f"{self.can_port} send piper leader go zero service")
-        rospy.loginfo(f"-----------------------RESET---------------------------")
-        self.piper.ReqMasterArmMoveToHome(1)
+    def handle_leader_go_zero_service(self, req, response):
+        self.get_logger().info(f"-----------------------RESET---------------------------")
+        self.get_logger().info(f"{self.can_port} send piper leader go zero service")
+        self.get_logger().info(f"-----------------------RESET---------------------------")
+        self.piper.move_leader_to_home()
         response.success = True
         response.message = str({self.can_port}) + "send piper leader go zero service success"
-        rospy.loginfo(f"Returning resetResponse: {response.success}, {response.message}")
+        self.get_logger().info(f"Returning resetResponse: {response.success}, {response.message}")
         return response
 
-    def handle_leader_follower_go_zero_service(self, req):
-        response = TriggerResponse()
-        rospy.loginfo(f"-----------------------RESET---------------------------")
-        rospy.loginfo(f"{self.can_port} send piper leader follower go zero service")
-        rospy.loginfo(f"-----------------------RESET---------------------------")
-        self.piper.ReqMasterArmMoveToHome(2)
+    def handle_leader_follower_go_zero_service(self, req, response):
+        self.get_logger().info(f"-----------------------RESET---------------------------")
+        self.get_logger().info(f"{self.can_port} send piper leader follower go zero service")
+        self.get_logger().info(f"-----------------------RESET---------------------------")
+        self.piper.move_leader_follower_to_home()
         response.success = True
         response.message = str({self.can_port}) + "send piper leader follower go zero service success"
-        rospy.loginfo(f"Returning resetResponse: {response.success}, {response.message}")
+        self.get_logger().info(f"Returning resetResponse: {response.success}, {response.message}")
         return response
 
-    def handle_restore_leader_follower_mode_service(self, req):
-        response = TriggerResponse()
-        rospy.loginfo(f"-----------------------RESET---------------------------")
-        rospy.loginfo(f"{self.can_port} send piper restore leader follower mode service")
-        rospy.loginfo(f"-----------------------RESET---------------------------")
-        self.piper.ReqMasterArmMoveToHome(0)
+    def handle_restore_leader_follower_mode_service(self, req, response):
+        self.get_logger().info(f"-----------------------RESET---------------------------")
+        self.get_logger().info(f"{self.can_port} send piper restore leader follower mode service")
+        self.get_logger().info(f"-----------------------RESET---------------------------")
+        self.piper.restore_leader_drag_mode()
         response.success = True
         response.message = str({self.can_port}) + "send piper restore leader follower mode service success"
-        rospy.loginfo(f"Returning resetResponse: {response.success}, {response.message}")
+        self.get_logger().info(f"Returning resetResponse: {response.success}, {response.message}")
         return response
+
+
+def main():
+    rclpy.init()
+    piper_leader_follower = C_PiperRosNode()
+    executor = MultiThreadedExecutor()
+    executor.add_node(piper_leader_follower)
+    spin_thread = threading.Thread(target=executor.spin, daemon=True)
+    spin_thread.start()
+    try:
+        piper_leader_follower.Pubilsh()
+    except (KeyboardInterrupt, ExternalShutdownException, ROSInterruptException):
+        pass
+    finally:
+        executor.shutdown()
+        piper_leader_follower.destroy_node()
+        rclpy.try_shutdown()
 
 
 if __name__ == "__main__":
-    try:
-        piper_leader_follower = C_PiperRosNode()
-        piper_leader_follower.Pubilsh()
-    except rospy.ROSInterruptException:
-        pass
+    main()

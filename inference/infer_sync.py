@@ -9,7 +9,6 @@ import tty
 from collections import deque
 
 import numpy as np
-import rospy
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from clients import OpenpiClient
@@ -18,6 +17,7 @@ from utils import (
     check_keyboard_input,
     get_config,
     get_inference_observation,
+    get_policy_images,
     get_rollout_observation,
     handle_interactive_mode,
     process_action,
@@ -27,7 +27,8 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
-from ros_operator import RosOperator
+from robot_config import add_robot_argument
+from ros_operator import Rate, RosOperator, is_shutdown, signal_shutdown
 
 observation_window = None
 observation_window_lock = threading.Lock()
@@ -41,7 +42,7 @@ def _on_sigint(signum, frame):
     except Exception:
         pass
     try:
-        rospy.signal_shutdown("SIGINT")
+        signal_shutdown("SIGINT")
     except Exception:
         pass
 
@@ -63,11 +64,7 @@ def update_observation_window(args, config, ros_operator):
             observation_window.append(
                 {
                     "qpos": None,
-                    "images": {
-                        config["camera_names"][0]: None,
-                        config["camera_names"][1]: None,
-                        config["camera_names"][2]: None,
-                    },
+                    "images": {name: None for name in config["camera_names"]},
                     "eef_pose": None,
                 }
             )
@@ -89,26 +86,20 @@ def inference_fn_sync(args, config, policy, ros_operator):
     start_time = time.perf_counter()
 
     with observation_window_lock:
-        # fetch images in sequence [front, left, right]
-        image_arrs = [
-            observation_window[-1]["images"][config["camera_names"][0]],
-            observation_window[-1]["images"][config["camera_names"][1]],
-            observation_window[-1]["images"][config["camera_names"][2]],
-        ]
+        # images keyed by camera name, in robot camera order
+        images = get_policy_images(observation_window[-1], config)
 
         if args.ctrl_type == "joint":
-            # state: Abs Joint 14dim
+            # state: Abs Joint (7 per arm)
             state = observation_window[-1]["qpos"]
         elif args.ctrl_type == "eef":
-            # state: Abs EEF 14dim
+            # state: Abs EEF (7 per arm)
             state = observation_window[-1]["eef_pose"]
         else:
             raise ValueError(f"Unknown ctrl_type: {args.ctrl_type}")
 
     payload = {
-        "top": image_arrs[0],
-        "left": image_arrs[1],
-        "right": image_arrs[2],
+        "images": images,
         "instruction": config["language_instruction"],
         "state": state,
     }
@@ -122,17 +113,22 @@ def inference_fn_sync(args, config, policy, ros_operator):
 # Main loop for the manipulation task
 def model_inference(args, config, ros_operator):
     if args.model == "openpi":
-        policy = OpenpiClient(host=args.host, port=args.port)
+        policy = OpenpiClient(
+            host=args.host,
+            port=args.port,
+            camera_names=config["camera_names"],
+            state_dim=config["state_dim"],
+        )
     else:
         raise ValueError(f"Unknown model: {args.model}")
 
     max_publish_step = config["episode_len"]
     chunk_size = config["chunk_size"]
 
-    left0 = config["left0"]
-    right0 = config["right0"]
+    # Initial joint positions, one 7-value list per arm
+    init_qpos = config["init_qpos"]
 
-    ros_operator.follower_arm_publish_continuous(left0, right0)
+    ros_operator.follower_arm_publish_continuous(init_qpos)
 
     print("Warmup the server...")
     policy.warmup()
@@ -140,21 +136,21 @@ def model_inference(args, config, ros_operator):
 
     input("Press enter to continue")
     task_time = time.time()
-    ros_operator.follower_arm_publish_continuous(left0, right0)
+    ros_operator.follower_arm_publish_continuous(init_qpos)
     recorder = InferenceDataRecorder(args, config, shutdown_event=shutdown_event)
 
     try:
         # Inference loop
-        while not rospy.is_shutdown():
+        while not is_shutdown():
             # The current time step
             t = 0
-            rate = rospy.Rate(args.publish_rate)
+            rate = Rate(args.publish_rate)
 
             reset_observation_window()
             action_buffer = np.zeros([chunk_size, config["state_dim"]])
             episode_closed = False
 
-            while t < max_publish_step and not rospy.is_shutdown() and not shutdown_event.is_set():
+            while t < max_publish_step and not is_shutdown() and not shutdown_event.is_set():
                 # Check for keyboard input (space to enter interactive mode)
                 key = check_keyboard_input()
                 if key == " ":
@@ -163,7 +159,7 @@ def model_inference(args, config, ros_operator):
                         recorder.save_episode()
                         episode_closed = True
                         # Reset to starting position
-                        ros_operator.follower_arm_publish_continuous(left0, right0)
+                        ros_operator.follower_arm_publish_continuous(init_qpos)
                         input("Press enter to continue")
                         task_time = time.time()
                         break  # Break inner loop to restart
@@ -188,14 +184,12 @@ def model_inference(args, config, ros_operator):
                 if recorder.enabled and observation_to_save is None:
                     break
 
+                arm_actions = process_action(config, act)
+                action_to_save = np.concatenate(arm_actions, axis=0)
                 if args.ctrl_type == "joint":
-                    left_action, right_action = process_action(config["task"], act)
-                    action_to_save = np.concatenate((left_action, right_action), axis=0)
-                    ros_operator.follower_arm_publish(left_action, right_action)
+                    ros_operator.follower_arm_publish(arm_actions)
                 elif args.ctrl_type == "eef":
-                    left_action, right_action = process_action(config["task"], act)
-                    action_to_save = np.concatenate((left_action, right_action), axis=0)
-                    ros_operator.follower_arm_pose_publish(left_action, right_action)
+                    ros_operator.follower_arm_pose_publish(arm_actions)
 
                 recorder.add_step(observation_to_save, action_to_save)
                 t += 1
@@ -207,7 +201,7 @@ def model_inference(args, config, ros_operator):
             if shutdown_event.is_set():
                 return
     finally:
-        ros_operator.follower_arm_publish_continuous(left0, right0)
+        ros_operator.follower_arm_publish_continuous(init_qpos)
 
 
 def get_arguments():
@@ -220,116 +214,7 @@ def get_arguments():
         default=10000,
         required=False,
     )
-    parser.add_argument(
-        "--img_front_topic",
-        action="store",
-        type=str,
-        help="img_front_topic",
-        default="/camera_f/color/image_raw",
-        required=False,
-    )
-    parser.add_argument(
-        "--img_left_topic",
-        action="store",
-        type=str,
-        help="img_left_topic",
-        default="/camera_l/color/image_raw",
-        required=False,
-    )
-    parser.add_argument(
-        "--img_right_topic",
-        action="store",
-        type=str,
-        help="img_right_topic",
-        default="/camera_r/color/image_raw",
-        required=False,
-    )
-    parser.add_argument(
-        "--img_front_depth_topic",
-        action="store",
-        type=str,
-        help="img_front_depth_topic",
-        default="/camera_f/depth/image_raw",
-        required=False,
-    )
-    parser.add_argument(
-        "--img_left_depth_topic",
-        action="store",
-        type=str,
-        help="img_left_depth_topic",
-        default="/camera_l/depth/image_raw",
-        required=False,
-    )
-    parser.add_argument(
-        "--img_right_depth_topic",
-        action="store",
-        type=str,
-        help="img_right_depth_topic",
-        default="/camera_r/depth/image_raw",
-        required=False,
-    )
-    parser.add_argument(
-        "--leader_arm_left_topic",
-        action="store",
-        type=str,
-        help="leader_arm_left_topic",
-        default="/leader/joint_left",
-        required=False,
-    )
-    parser.add_argument(
-        "--leader_arm_right_topic",
-        action="store",
-        type=str,
-        help="leader_arm_right_topic",
-        default="/leader/joint_right",
-        required=False,
-    )
-    parser.add_argument(
-        "--follower_arm_left_topic",
-        action="store",
-        type=str,
-        help="follower_arm_left_topic",
-        default="/follower/joint_left",
-        required=False,
-    )
-    parser.add_argument(
-        "--follower_arm_right_topic",
-        action="store",
-        type=str,
-        help="follower_arm_right_topic",
-        default="/follower/joint_right",
-        required=False,
-    )
-    parser.add_argument(
-        "--pos_cmd_left_topic",
-        action="store",
-        type=str,
-        help="pos_cmd_left_topic",
-        default="/follower/pos_cmd_left",
-        required=False,
-    )
-    parser.add_argument(
-        "--pos_cmd_right_topic",
-        action="store",
-        type=str,
-        help="pos_cmd_right_topic",
-        default="/follower/pos_cmd_right",
-        required=False,
-    )
-    parser.add_argument(
-        "--follower_arm_left_pose_topic",
-        action="store",
-        type=str,
-        default="/follower/end_pose_euler_left",
-        required=False,
-    )
-    parser.add_argument(
-        "--follower_arm_right_pose_topic",
-        action="store",
-        type=str,
-        default="/follower/end_pose_euler_right",
-        required=False,
-    )
+    add_robot_argument(parser)
     parser.add_argument(
         "--publish_rate",
         action="store",

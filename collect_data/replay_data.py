@@ -1,14 +1,23 @@
 # coding=utf-8
 import argparse
 import os
+import sys
+import time
 
 import h5py
 import numpy as np
-import rospy
+import rclpy
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Header
 
 from piper_msgs.msg import PosCmd
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.append(PROJECT_ROOT)
+
+from robot_config import add_robot_argument, get_robot_config
+from ros_operator import Rate
 
 
 def load_hdf5(dataset_dir, dataset_name):
@@ -24,98 +33,98 @@ def load_hdf5(dataset_dir, dataset_name):
     return qpos, action, eef_pose
 
 
-def publish_joint_replay(
-    joint_state_msg,
-    timestamp,
-    action,
-    joint_left_publisher,
-    joint_right_publisher,
-):
+def publish_joint_replay(joint_state_msg, timestamp, arm_actions, publishers):
     joint_state_msg.header.stamp = timestamp
-
-    joint_state_msg.position = action[:7]
-    joint_left_publisher.publish(joint_state_msg)
-
-    joint_state_msg.position = action[7:]
-    joint_right_publisher.publish(joint_state_msg)
+    for arm_action, publisher in zip(arm_actions, publishers):
+        # ROS 2 message fields only accept Python floats (not np.float32)
+        joint_state_msg.position = [float(v) for v in arm_action]
+        publisher.publish(joint_state_msg)
 
 
-def publish_eef_replay(left_publisher, right_publisher, eef_pose):
-    left_msg = PosCmd()
-    left_msg.x = eef_pose[0]
-    left_msg.y = eef_pose[1]
-    left_msg.z = eef_pose[2]
-    left_msg.roll = eef_pose[3]
-    left_msg.pitch = eef_pose[4]
-    left_msg.yaw = eef_pose[5]
-    left_msg.gripper = eef_pose[6]
-    left_msg.mode1 = 0
-    left_msg.mode2 = 0
-    left_publisher.publish(left_msg)
+def publish_eef_replay(arm_poses, publishers):
+    for arm_pose, publisher in zip(arm_poses, publishers):
+        arm_pose = [float(v) for v in arm_pose]
+        msg = PosCmd()
+        msg.x = arm_pose[0]
+        msg.y = arm_pose[1]
+        msg.z = arm_pose[2]
+        msg.roll = arm_pose[3]
+        msg.pitch = arm_pose[4]
+        msg.yaw = arm_pose[5]
+        msg.gripper = arm_pose[6]
+        msg.mode1 = 0
+        msg.mode2 = 0
+        publisher.publish(msg)
 
-    right_msg = PosCmd()
-    right_msg.x = eef_pose[7]
-    right_msg.y = eef_pose[8]
-    right_msg.z = eef_pose[9]
-    right_msg.roll = eef_pose[10]
-    right_msg.pitch = eef_pose[11]
-    right_msg.yaw = eef_pose[12]
-    right_msg.gripper = eef_pose[13]
-    right_msg.mode1 = 0
-    right_msg.mode2 = 0
-    right_publisher.publish(right_msg)
+
+def wait_for_subscribers(publishers, timeout=3.0):
+    """Give DDS discovery time to match the arm nodes so the first commands are not dropped."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and rclpy.ok():
+        if all(publisher.get_subscription_count() > 0 for publisher in publishers):
+            # Discovery is not always symmetric yet when the publisher first sees the subscriber
+            time.sleep(0.5)
+            return True
+        time.sleep(0.05)
+    print("Warning: no subscriber on some control topics; is the arm node running in mode 1?")
+    return False
 
 
 def main(args):
-    rospy.init_node("replay_node")
+    rclpy.init()
+    node = rclpy.create_node("replay_node")
+    try:
+        replay(args, node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
 
-    joint_left_publisher = rospy.Publisher(args.control_arm_left_topic, JointState, queue_size=10)
-    joint_right_publisher = rospy.Publisher(args.control_arm_right_topic, JointState, queue_size=10)
 
-    eef_left_publisher = rospy.Publisher(args.control_arm_left_pose_topic, PosCmd, queue_size=10)
-    eef_right_publisher = rospy.Publisher(args.control_arm_right_pose_topic, PosCmd, queue_size=10)
+def replay(args, node):
+    robot = get_robot_config(args.robot)
+    # In mode 1 the arm node follows the leader topic, so joint commands are published there
+    joint_publishers = [node.create_publisher(JointState, arm.leader_topic, 10) for arm in robot.arms]
+    eef_publishers = [node.create_publisher(PosCmd, arm.pos_cmd_topic, 10) for arm in robot.arms]
 
     dataset_dir = os.path.join(args.dataset_dir, args.task_name)
     dataset_name = f"episode_{args.episode_idx}"
     qposs, actions, eef_poses = load_hdf5(dataset_dir, dataset_name)
+    if actions.shape[1] != robot.state_dim:
+        raise ValueError(
+            f"Episode has {actions.shape[1]}-dim actions but robot '{robot.name}' expects {robot.state_dim}; "
+            "check --robot"
+        )
 
     joint_state_msg = JointState()
     joint_state_msg.header = Header()
     joint_state_msg.name = ["joint0", "joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
 
-    rate = rospy.Rate(args.frame_rate)
+    if args.replay_mode == "joint":
+        wait_for_subscribers(joint_publishers)
+    else:
+        wait_for_subscribers(eef_publishers)
+
+    rate = Rate(args.frame_rate)
 
     for index in range(len(actions)):
-        if rospy.is_shutdown():
+        if not rclpy.ok():
             break
 
         if args.replay_mode == "joint":
-            publish_joint_replay(
-                joint_state_msg,
-                rospy.Time.now(),
-                actions[index],
-                joint_left_publisher,
-                joint_right_publisher,
-            )
+            arm_actions = robot.split_arms(actions[index])
+            publish_joint_replay(joint_state_msg, node.get_clock().now().to_msg(), arm_actions, joint_publishers)
             print(
                 "joint replay",
-                "left_action:",
-                np.round(actions[index][:7], 4),
-                "right_action:",
-                np.round(actions[index][7:], 4),
+                *[f"{name}_action: {np.round(a, 4)}" for name, a in zip(robot.arm_names, arm_actions)],
             )
         else:
-            publish_eef_replay(
-                eef_left_publisher,
-                eef_right_publisher,
-                eef_poses[index],
-            )
+            arm_poses = robot.split_arms(eef_poses[index])
+            publish_eef_replay(arm_poses, eef_publishers)
             print(
                 "eef replay",
-                "left_eef:",
-                np.round(eef_poses[index][:7], 4),
-                "right_eef:",
-                np.round(eef_poses[index][7:], 4),
+                *[f"{name}_eef: {np.round(p, 4)}" for name, p in zip(robot.arm_names, arm_poses)],
             )
 
         rate.sleep()
@@ -156,38 +165,7 @@ if __name__ == "__main__":
         help="Replay using joint commands or end-effector pose commands.",
         required=False,
     )
-    parser.add_argument(
-        "--control_arm_left_topic",
-        action="store",
-        type=str,
-        help="control_arm_left_topic",
-        default="/leader/joint_left",
-        required=False,
-    )
-    parser.add_argument(
-        "--control_arm_right_topic",
-        action="store",
-        type=str,
-        help="control_arm_right_topic",
-        default="/leader/joint_right",
-        required=False,
-    )
-    parser.add_argument(
-        "--control_arm_left_pose_topic",
-        action="store",
-        type=str,
-        help="control_arm_left_pose_topic",
-        default="/follower/pos_cmd_left",
-        required=False,
-    )
-    parser.add_argument(
-        "--control_arm_right_pose_topic",
-        action="store",
-        type=str,
-        help="control_arm_right_pose_topic",
-        default="/follower/pos_cmd_right",
-        required=False,
-    )
+    add_robot_argument(parser)
     parser.add_argument(
         "--frame_rate",
         action="store",

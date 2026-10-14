@@ -1,19 +1,14 @@
-ws_path=$(pwd)
-echo $ws_path
+#!/bin/bash
+# List connected RealSense camera serial numbers.
+# rs-enumerate-devices ships with ros-$ROS_DISTRO-librealsense2 (a dependency of realsense2_camera).
 
-cd $ws_path/camera_ws
-
-file="$ws_path/camera_ws/devel/lib/realsense2_camera/list_device_camera"
-if [[ -f "$file" ]]; then
-    echo "list_devices_camera exist."
-else
-    echo "list_devices_camera no exist!"
-    exit 0
+if ! command -v rs-enumerate-devices >/dev/null 2>&1; then
+    echo "rs-enumerate-devices not found. Source /opt/ros/\$ROS_DISTRO/setup.bash or install librealsense2-utils."
+    exit 1
 fi
 
-echo ""
 echo "camera serial number: "
-$ws_path/camera_ws/devel/lib/realsense2_camera/list_device_camera
+rs-enumerate-devices -s
 
 echo "-----------------"
 echo ""

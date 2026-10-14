@@ -9,7 +9,6 @@ import tty
 from collections import deque
 
 import numpy as np
-import rospy
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from clients import OpenpiClient
@@ -18,6 +17,7 @@ from utils import (
     check_keyboard_input,
     get_config,
     get_inference_observation,
+    get_policy_images,
     get_rollout_observation,
     handle_interactive_mode,
     process_action,
@@ -27,7 +27,8 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
-from ros_operator import RosOperator
+from robot_config import add_robot_argument
+from ros_operator import Rate, RosOperator, is_shutdown, logwarn, signal_shutdown
 
 observation_window = None
 observation_window_lock = threading.Lock()
@@ -50,7 +51,7 @@ def _on_sigint(signum, frame):
     except Exception:
         pass
     try:
-        rospy.signal_shutdown("SIGINT")
+        signal_shutdown("SIGINT")
     except Exception:
         pass
 
@@ -69,13 +70,13 @@ def begin_new_episode(wait_timeout=None):
     with inference_state_cond:
         episode_id += 1
         deadline = None if wait_timeout is None else time.monotonic() + wait_timeout
-        while inflight_inference_count > 0 and not rospy.is_shutdown():
+        while inflight_inference_count > 0 and not is_shutdown():
             if deadline is None:
                 inference_state_cond.wait()
                 continue
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                rospy.logwarn("Timed out waiting for in-flight inference; stale results will be discarded")
+                logwarn("Timed out waiting for in-flight inference; stale results will be discarded")
                 break
             inference_state_cond.wait(timeout=remaining)
         return episode_id
@@ -96,11 +97,7 @@ def update_observation_window(args, config, ros_operator):
             observation_window.append(
                 {
                     "qpos": None,
-                    "images": {
-                        config["camera_names"][0]: None,
-                        config["camera_names"][1]: None,
-                        config["camera_names"][2]: None,
-                    },
+                    "images": {name: None for name in config["camera_names"]},
                     "eef_pose": None,
                 }
             )
@@ -175,14 +172,14 @@ class StreamActionBuffer:
     def integrate_new_chunk(self, actions_chunk: np.ndarray):
         # only for the new chunk inferenced by async inference, already selected [d:s+d)
         if actions_chunk is None or actions_chunk.shape[0] == 0:
-            rospy.logwarn("actions_chunk is None or len(actions_chunk) == 0 when integrating new chunk")
+            logwarn("actions_chunk is None or len(actions_chunk) == 0 when integrating new chunk")
             return
         L = actions_chunk.shape[0]
         with self.lock:
             assert L == self.exec_horizon, f"{L} != {self.exec_horizon}"
             if self.cur_len == 0:
                 # warning: this should not happen
-                rospy.logwarn("cur_len is 0 when integrating new chunk")
+                logwarn("cur_len is 0 when integrating new chunk")
                 self.cur_chunk[:L] = actions_chunk
                 self.cur_len = L
             else:
@@ -192,13 +189,13 @@ class StreamActionBuffer:
     def integrate_new_chunk_streaming(self, actions_chunk: np.ndarray, stamp: int):
         # only for the new chunk inferenced by async streaming inference, already removed [0:d), but can be different lengths
         if actions_chunk is None or actions_chunk.shape[0] == 0:
-            rospy.logwarn("actions_chunk is None or len(actions_chunk) == 0 when integrating new chunk")
+            logwarn("actions_chunk is None or len(actions_chunk) == 0 when integrating new chunk")
             return
         L = actions_chunk.shape[0]
         with self.lock:
             if self.cur_len == 0:
                 # warning: this should not happen
-                rospy.logwarn("cur_len is 0 when integrating new chunk")
+                logwarn("cur_len is 0 when integrating new chunk")
                 safe_L = min(L, self.exec_horizon)
                 self.cur_chunk[:safe_L] = actions_chunk[:safe_L]
                 self.cur_len = safe_L
@@ -252,26 +249,20 @@ def inference_fn_sync(args, config, policy, ros_operator):
     start_time = time.perf_counter()
 
     with observation_window_lock:
-        # fetch images in sequence [front, left, right]
-        image_arrs = [
-            observation_window[-1]["images"][config["camera_names"][0]],
-            observation_window[-1]["images"][config["camera_names"][1]],
-            observation_window[-1]["images"][config["camera_names"][2]],
-        ]
+        # images keyed by camera name, in robot camera order
+        images = get_policy_images(observation_window[-1], config)
 
         if args.ctrl_type == "joint":
-            # state: Abs Joint 14dim
+            # state: Abs Joint (7 per arm)
             state = observation_window[-1]["qpos"]
         elif args.ctrl_type == "eef":
-            # state: Abs EEF 14dim
+            # state: Abs EEF (7 per arm)
             state = observation_window[-1]["eef_pose"]
         else:
             raise ValueError(f"Unknown ctrl_type: {args.ctrl_type}")
 
     payload = {
-        "top": image_arrs[0],
-        "left": image_arrs[1],
-        "right": image_arrs[2],
+        "images": images,
         "instruction": config["language_instruction"],
         "state": state,
         "action_prefix": None,
@@ -291,10 +282,10 @@ def inference_fn_sync(args, config, policy, ros_operator):
 def inference_fn_async(args, config, policy, ros_operator, action_buffer):
     global inference_stamp, inflight_inference_count
 
-    while not rospy.is_shutdown():
+    while not is_shutdown():
         try:
             inference_paused.wait()
-            if rospy.is_shutdown():
+            if is_shutdown():
                 break
 
             with inference_state_cond:
@@ -326,26 +317,20 @@ def inference_fn_async(args, config, policy, ros_operator, action_buffer):
             start_time = time.perf_counter()
 
             with observation_window_lock:
-                # fetch images in sequence [front, left, right]
-                image_arrs = [
-                    observation_window[-1]["images"][config["camera_names"][0]],
-                    observation_window[-1]["images"][config["camera_names"][1]],
-                    observation_window[-1]["images"][config["camera_names"][2]],
-                ]
+                # images keyed by camera name, in robot camera order
+                images = get_policy_images(observation_window[-1], config)
 
                 if args.ctrl_type == "joint":
-                    # state: Abs Joint 14dim
+                    # state: Abs Joint (7 per arm)
                     state = observation_window[-1]["qpos"]
                 elif args.ctrl_type == "eef":
-                    # state: Abs EEF 14dim
+                    # state: Abs EEF (7 per arm)
                     state = observation_window[-1]["eef_pose"]
                 else:
                     raise ValueError(f"Unknown ctrl_type: {args.ctrl_type}")
 
             payload = {
-                "top": image_arrs[0],
-                "left": image_arrs[1],
-                "right": image_arrs[2],
+                "images": images,
                 "instruction": config["language_instruction"],
                 "state": state,
                 "action_prefix": action_prefix,
@@ -354,7 +339,7 @@ def inference_fn_async(args, config, policy, ros_operator, action_buffer):
 
             def on_actions_ready(actions_chunk):
                 if not is_current_episode(request_episode_id):
-                    rospy.logwarn(
+                    logwarn(
                         f"Discard async streaming chunk from stale episode {request_episode_id}; current={episode_id}"
                     )
                     return
@@ -372,7 +357,7 @@ def inference_fn_async(args, config, policy, ros_operator, action_buffer):
                 )
 
                 if not is_current_episode(request_episode_id):
-                    rospy.logwarn(
+                    logwarn(
                         f"Discard async inference result from stale episode {request_episode_id}; current={episode_id}"
                     )
                 elif actions is not None and len(actions) > 0:
@@ -385,7 +370,7 @@ def inference_fn_async(args, config, policy, ros_operator, action_buffer):
             inference_paused.clear()
 
         except Exception as e:
-            rospy.logwarn(f"[inference_fn_async] {e}")
+            logwarn(f"[inference_fn_async] {e}")
             inference_paused.clear()
             time.sleep(0.1)
             continue
@@ -409,18 +394,23 @@ def model_inference(args, config, ros_operator):
     global inference_stamp
 
     if args.model == "openpi":
-        policy = OpenpiClient(host=args.host, port=args.port)
+        policy = OpenpiClient(
+            host=args.host,
+            port=args.port,
+            camera_names=config["camera_names"],
+            state_dim=config["state_dim"],
+        )
     else:
         raise ValueError(f"Unknown model: {args.model}")
 
     max_publish_step = config["episode_len"]
 
-    left0 = config["left0"]
-    right0 = config["right0"]
+    # Initial joint positions, one 7-value list per arm
+    init_qpos = config["init_qpos"]
 
     print(config)
 
-    ros_operator.follower_arm_publish_continuous(left0, right0)
+    ros_operator.follower_arm_publish_continuous(init_qpos)
 
     print("Warmup the server...")
     policy.warmup(rtc=(args.mode == "rtc"), streaming=args.streaming)
@@ -428,7 +418,7 @@ def model_inference(args, config, ros_operator):
 
     input("Press enter to continue")
     task_time = time.time()
-    ros_operator.follower_arm_publish_continuous(left0, right0)
+    ros_operator.follower_arm_publish_continuous(init_qpos)
 
     # Create action buffer once (outside the loop)
     action_buffer = StreamActionBuffer(
@@ -441,10 +431,10 @@ def model_inference(args, config, ros_operator):
 
     try:
         # Inference loop
-        while not rospy.is_shutdown():
+        while not is_shutdown():
             # The current time step
             t = 0
-            rate = rospy.Rate(args.publish_rate)
+            rate = Rate(args.publish_rate)
 
             # Reset observation window and action buffer for new episode
             begin_new_episode(wait_timeout=5.0)
@@ -464,7 +454,7 @@ def model_inference(args, config, ros_operator):
 
             last_valid_act = None
 
-            while t < max_publish_step and not rospy.is_shutdown() and not shutdown_event.is_set():
+            while t < max_publish_step and not is_shutdown() and not shutdown_event.is_set():
                 print(
                     f"[Step {t:4d}] cur_step={action_buffer.cur_step:3d} | cur_chunk={action_buffer.cur_len:3d} | next_chunk={action_buffer.next_len:3d} | cur_stamp={action_buffer.cur_stamp:3d}"
                 )
@@ -477,7 +467,7 @@ def model_inference(args, config, ros_operator):
                         recorder.save_episode()
                         episode_closed = True
                         # Reset to starting position
-                        ros_operator.follower_arm_publish_continuous(left0, right0)
+                        ros_operator.follower_arm_publish_continuous(init_qpos)
                         input("Press enter to continue")
                         task_time = time.time()
                         break  # Break inner loop to restart
@@ -497,7 +487,7 @@ def model_inference(args, config, ros_operator):
                 act = action_buffer.get_next_action()
 
                 if act is None:
-                    rospy.logwarn(f"[Step {t:4d}] act is None")
+                    logwarn(f"[Step {t:4d}] act is None")
                     if last_valid_act is not None:
                         act = last_valid_act
                     else:
@@ -508,14 +498,12 @@ def model_inference(args, config, ros_operator):
                 if recorder.enabled and observation_to_save is None:
                     break
 
+                arm_actions = process_action(config, act)
+                action_to_save = np.concatenate(arm_actions, axis=0)
                 if args.ctrl_type == "joint":
-                    left_action, right_action = process_action(config["task"], act)
-                    action_to_save = np.concatenate((left_action, right_action), axis=0)
-                    ros_operator.follower_arm_publish(left_action, right_action)
+                    ros_operator.follower_arm_publish(arm_actions)
                 elif args.ctrl_type == "eef":
-                    left_action, right_action = process_action(config["task"], act)
-                    action_to_save = np.concatenate((left_action, right_action), axis=0)
-                    ros_operator.follower_arm_pose_publish(left_action, right_action)
+                    ros_operator.follower_arm_pose_publish(arm_actions)
 
                 recorder.add_step(observation_to_save, action_to_save)
                 t += 1
@@ -527,7 +515,7 @@ def model_inference(args, config, ros_operator):
             if shutdown_event.is_set():
                 return
     finally:
-        ros_operator.follower_arm_publish_continuous(left0, right0)
+        ros_operator.follower_arm_publish_continuous(init_qpos)
 
 
 def get_arguments():
@@ -540,116 +528,7 @@ def get_arguments():
         default=10000,
         required=False,
     )
-    parser.add_argument(
-        "--img_front_topic",
-        action="store",
-        type=str,
-        help="img_front_topic",
-        default="/camera_f/color/image_raw",
-        required=False,
-    )
-    parser.add_argument(
-        "--img_left_topic",
-        action="store",
-        type=str,
-        help="img_left_topic",
-        default="/camera_l/color/image_raw",
-        required=False,
-    )
-    parser.add_argument(
-        "--img_right_topic",
-        action="store",
-        type=str,
-        help="img_right_topic",
-        default="/camera_r/color/image_raw",
-        required=False,
-    )
-    parser.add_argument(
-        "--img_front_depth_topic",
-        action="store",
-        type=str,
-        help="img_front_depth_topic",
-        default="/camera_f/depth/image_raw",
-        required=False,
-    )
-    parser.add_argument(
-        "--img_left_depth_topic",
-        action="store",
-        type=str,
-        help="img_left_depth_topic",
-        default="/camera_l/depth/image_raw",
-        required=False,
-    )
-    parser.add_argument(
-        "--img_right_depth_topic",
-        action="store",
-        type=str,
-        help="img_right_depth_topic",
-        default="/camera_r/depth/image_raw",
-        required=False,
-    )
-    parser.add_argument(
-        "--leader_arm_left_topic",
-        action="store",
-        type=str,
-        help="leader_arm_left_topic",
-        default="/leader/joint_left",
-        required=False,
-    )
-    parser.add_argument(
-        "--leader_arm_right_topic",
-        action="store",
-        type=str,
-        help="leader_arm_right_topic",
-        default="/leader/joint_right",
-        required=False,
-    )
-    parser.add_argument(
-        "--follower_arm_left_topic",
-        action="store",
-        type=str,
-        help="follower_arm_left_topic",
-        default="/follower/joint_left",
-        required=False,
-    )
-    parser.add_argument(
-        "--follower_arm_right_topic",
-        action="store",
-        type=str,
-        help="follower_arm_right_topic",
-        default="/follower/joint_right",
-        required=False,
-    )
-    parser.add_argument(
-        "--pos_cmd_left_topic",
-        action="store",
-        type=str,
-        help="pos_cmd_left_topic",
-        default="/follower/pos_cmd_left",
-        required=False,
-    )
-    parser.add_argument(
-        "--pos_cmd_right_topic",
-        action="store",
-        type=str,
-        help="pos_cmd_right_topic",
-        default="/follower/pos_cmd_right",
-        required=False,
-    )
-    parser.add_argument(
-        "--follower_arm_left_pose_topic",
-        action="store",
-        type=str,
-        default="/follower/end_pose_euler_left",
-        required=False,
-    )
-    parser.add_argument(
-        "--follower_arm_right_pose_topic",
-        action="store",
-        type=str,
-        default="/follower/end_pose_euler_right",
-        required=False,
-    )
+    add_robot_argument(parser)
     parser.add_argument(
         "--publish_rate",
         action="store",

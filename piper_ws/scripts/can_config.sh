@@ -93,7 +93,7 @@
 #-------------------------------------------------------------------------------------------------#
 
 # Predefined CAN module count
-EXPECTED_CAN_COUNT=2
+EXPECTED_CAN_COUNT=1
 
 if [ "$EXPECTED_CAN_COUNT" -eq 1 ]; then
     # Default CAN name, configurable through a command-line argument

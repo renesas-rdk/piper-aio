@@ -2,28 +2,18 @@ import numpy as np
 from openpi_client import image_tools, websocket_client_policy
 
 
-def _random_observation() -> dict:
+def _random_observation(camera_names, state_dim) -> dict:
     return {
-        "state": np.ones((14,)),
-        "images": {
-            "cam_high": np.random.randint(256, size=(3, 224, 224), dtype=np.uint8),
-            "cam_left_wrist": np.random.randint(256, size=(3, 224, 224), dtype=np.uint8),
-            "cam_right_wrist": np.random.randint(256, size=(3, 224, 224), dtype=np.uint8),
-        },
+        "state": np.ones((state_dim,)),
+        "images": {name: np.random.randint(256, size=(3, 224, 224), dtype=np.uint8) for name in camera_names},
         "prompt": "do something",
     }
 
 
-def _random_observation_rtc() -> dict:
+def _random_observation_rtc(camera_names, state_dim) -> dict:
     return {
-        "state": np.ones((14,)),
-        "images": {
-            "cam_high": np.random.randint(256, size=(3, 224, 224), dtype=np.uint8),
-            "cam_left_wrist": np.random.randint(256, size=(3, 224, 224), dtype=np.uint8),
-            "cam_right_wrist": np.random.randint(256, size=(3, 224, 224), dtype=np.uint8),
-        },
-        "prompt": "do something",
-        "action_prefix": np.ones((4, 14)),
+        **_random_observation(camera_names, state_dim),
+        "action_prefix": np.ones((4, state_dim)),
         "delay": np.array(4),
     }
 
@@ -33,23 +23,26 @@ class OpenpiClient:
         self,
         host: str,
         port: int,
+        camera_names: list[str],
+        state_dim: int,
     ) -> None:
+        self.camera_names = list(camera_names)
+        self.state_dim = state_dim
 
         # build client to connect server policy
         self.client = websocket_client_policy.WebsocketClientPolicy(host, port)
 
     def _build_observation(self, payload) -> dict:
-        images = [payload["top"], payload["left"], payload["right"]]
-        images = [image_tools.convert_to_uint8(image_tools.resize_with_pad(img, 224, 224)) for img in images]
-        images = [img.transpose(2, 0, 1) for img in images]
+        # payload["images"] maps camera name -> HWC image, e.g. cam_high/cam_left_wrist/cam_right_wrist
+        # for the dual robot or cam_side/cam_wrist for the single robot
+        images = {}
+        for name in self.camera_names:
+            img = image_tools.convert_to_uint8(image_tools.resize_with_pad(payload["images"][name], 224, 224))
+            images[name] = img.transpose(2, 0, 1)
 
         observation = {
             "state": payload["state"],
-            "images": {
-                "cam_high": images[0],
-                "cam_left_wrist": images[1],
-                "cam_right_wrist": images[2],
-            },
+            "images": images,
             "prompt": payload["instruction"],
         }
 
@@ -76,11 +69,13 @@ class OpenpiClient:
             return response["actions"]
 
     def warmup(self, rtc: bool = False, streaming: bool = False) -> None:
+        observation = _random_observation(self.camera_names, self.state_dim)
+        observation_rtc = _random_observation_rtc(self.camera_names, self.state_dim)
         if streaming:
-            self.client.infer_streaming(_random_observation())
+            self.client.infer_streaming(observation)
             if rtc:
-                self.client.infer_streaming(_random_observation_rtc())
+                self.client.infer_streaming(observation_rtc)
         else:
-            self.client.infer(_random_observation())
+            self.client.infer(observation)
             if rtc:
-                self.client.infer(_random_observation_rtc())
+                self.client.infer(observation_rtc)
