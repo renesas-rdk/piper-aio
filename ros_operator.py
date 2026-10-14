@@ -395,13 +395,13 @@ class RosOperator:
         last_warning = None
 
         print("\n\033[36m=== Recording started ===\033[0m")
-        print("\033[33mPress SPACE to stop recording, then -> to save/continue or <- to discard/restart\033[0m\n")
+        print("\033[33mPress SPACE to stop recording, then 's' to save/continue or 'q' to discard/restart\033[0m\n")
 
         while not is_shutdown():
             key = keyboard_handler.get_key()
             if key == " ":
                 print(
-                    "\n\033[33m\nRecording paused. Press -> to SAVE (continue) or <- to DISCARD (restart): \033[0m",
+                    "\n\033[33m\nRecording paused. Press 's' to SAVE (continue) or 'q' to DISCARD (restart): \033[0m",
                     end="",
                     flush=True,
                 )

@@ -20,7 +20,7 @@ if PROJECT_ROOT not in sys.path:
 
 from robot_config import DEFAULT_ROBOT, ROBOT_CONFIGS, get_robot_config
 
-INSTRUCTION = "Open the RDK box and pick the board out of the box, then place it on the top of the box."
+INSTRUCTION = "Example"
 DEFAULT_COLLECT = "teleop"
 
 EPISODE_INDEX_PATTERN = re.compile(r"episode_(\d+)\.hdf5$")
