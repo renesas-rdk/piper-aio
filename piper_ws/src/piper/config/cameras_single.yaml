@@ -12,17 +12,15 @@
 #                 the frame rate is the camera default for that size
 #   pixel_format: YUYV (default) or another raw format the camera supports
 cameras:
-  - name: camera_wrist
-    type: realsense
-    serial_no: "814412072260"
+  - name: camera_side
+    type: usb
+    video_device: /dev/video0
     width: 640
     height: 480
-    fps: 30
-    enable_depth: false
 
-  - name: camera_side
+  - name: camera_wrist
     type: realsense
-    serial_no: "814412070695"
+    serial_no: ""
     width: 640
     height: 480
     fps: 30

@@ -20,7 +20,6 @@
 #   ./start_collect.sh single --cut_head --cut_tail --dataset_dir ~/data --task_name pick_cube
 #   ./start_collect.sh single --no-lerobot --dataset_dir ~/data --task_name pick_cube
 #   ./start_collect.sh --no-view --dataset_dir ~/data --task_name fold_towel
-#   ./start_collect.sh single --dataset_dir /mnt/data/thanhnguyen/training/unbox_rdk_4 --task_name unbox_rdk
 #
 # Prerequisites (same as the manual flow): ROS 2 + the piper workspace
 # sourced, the piperaio venv activated, arms powered on. The camera
