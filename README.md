@@ -90,7 +90,7 @@ Both layouts need **a control machine** with enough USB bandwidth for all camera
 #### Clone the Repository
 
 ```bash
-git clone --recurse-submodules https://github.com/innovator-zero/piper-aio.git
+git clone --recurse-submodules https://github.com/renesas-rdk/piper-aio.git
 cd piper-aio
 ```
 
@@ -149,7 +149,7 @@ Create the main environment used by ROS control and data collection. ROS 2 Pytho
 python3 -m venv --system-site-packages ~/venvs/piperaio
 source ~/venvs/piperaio/bin/activate
 
-pip install python-can piper_sdk
+pip install python-can
 pip install git+https://github.com/agilexrobotics/pyAgxArm.git
 pip install h5py opencv-python matplotlib dm-env pyyaml
 ```
